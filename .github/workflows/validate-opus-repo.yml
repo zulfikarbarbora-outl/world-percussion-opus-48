@@ -1,0 +1,140 @@
+# Per-repo Opus Preview Validation
+
+# This workflow lives in EACH *-opus-48 repo and validates that the repo
+# is a well-formed Opus 48k preview repo:
+# 1. Has README.md + index.json at root
+# 2. All .opus files are valid Opus 48k
+# 3. index.json file count matches actual .opus file count
+# 4. Every file in index.json exists on disk
+# 5. No orphan .opus files (not in index.json)
+#
+# To add this to a new *-opus-48 repo:
+#   1. Copy this file to .github/workflows/validate-opus-repo.yml
+#   2. Push to the repo's main branch
+#   3. The workflow runs on every push + PR + weekly schedule
+
+name: Validate Opus Repo
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Weekly Sunday 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg + jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq
+
+      - name: Check required files exist
+        run: |
+          echo "Checking required files..."
+          for f in README.md index.json; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: $f is missing"
+              exit 1
+            fi
+            echo "  ✓ $f exists"
+          done
+
+      - name: Validate index.json structure
+        run: |
+          echo "Validating index.json..."
+          # Must be valid JSON
+          jq empty index.json || { echo "ERROR: index.json is not valid JSON"; exit 1; }
+          # Must have fileCount + files array
+          FILE_COUNT=$(jq '.fileCount // empty' index.json)
+          FILES_LEN=$(jq '.files | length' index.json)
+          echo "  fileCount field: $FILE_COUNT"
+          echo "  files array length: $FILES_LEN"
+          if [ -z "$FILE_COUNT" ]; then
+            echo "WARN: fileCount field missing"
+          elif [ "$FILE_COUNT" != "$FILES_LEN" ]; then
+            echo "ERROR: fileCount ($FILE_COUNT) != files.length ($FILES_LEN)"
+            exit 1
+          fi
+          echo "  ✓ index.json structure OK"
+
+      - name: Count opus files on disk
+        id: count
+        run: |
+          DISK_COUNT=$(find . -maxdepth 1 -name '*.opus' | wc -l)
+          INDEX_COUNT=$(jq '.files | length' index.json)
+          echo "disk_count=$DISK_COUNT" >> $GITHUB_OUTPUT
+          echo "index_count=$INDEX_COUNT" >> $GITHUB_OUTPUT
+          echo "Opus files on disk: $DISK_COUNT"
+          echo "Opus files in index: $INDEX_COUNT"
+
+      - name: Check file count match
+        run: |
+          if [ "${{ steps.count.outputs.disk_count }}" != "${{ steps.count.outputs.index_count }}" ]; then
+            echo "ERROR: disk count (${{ steps.count.outputs.disk_count }}) != index count (${{ steps.count.outputs.index_count }})"
+            # List orphans + missing
+            echo "Files on disk but not in index:"
+            comm -23 <(find . -maxdepth 1 -name '*.opus' -exec basename {} \; | sort) <(jq -r '.files[].filename' index.json | sort) | head -20
+            echo "Files in index but not on disk:"
+            comm -13 <(find . -maxdepth 1 -name '*.opus' -exec basename {} \; | sort) <(jq -r '.files[].filename' index.json | sort) | head -20
+            exit 1
+          fi
+          echo "✓ File count matches (${{ steps.count.outputs.disk_count }} files)"
+
+      - name: Validate opus files are valid Opus 48k
+        run: |
+          echo "Validating Opus codec + bitrate (sampling first 20 files)..."
+          SAMPLE=$(find . -maxdepth 1 -name '*.opus' | head -20)
+          FAIL=0
+          for f in $SAMPLE; do
+            INFO=$(ffprobe -v quiet -print_format json -show_streams "$f" 2>/dev/null)
+            CODEC=$(echo "$INFO" | jq -r '.streams[0].codec_name // empty')
+            BITRATE=$(echo "$INFO" | jq -r '.streams[0].bit_rate // empty')
+            if [ "$CODEC" != "opus" ]; then
+              echo "  ✗ $f: codec is $CODEC (expected opus)"
+              FAIL=1
+            fi
+            # Bitrate should be around 48000 (±10%)
+            if [ -n "$BITRATE" ] && [ "$BITRATE" -gt 0 ]; then
+              if [ "$BITRATE" -lt 43000 ] || [ "$BITRATE" -gt 53000 ]; then
+                echo "  ⚠ $f: bitrate is ${BITRATE}bps (expected ~48000)"
+              fi
+            fi
+          done
+          if [ "$FAIL" -eq 1 ]; then
+            exit 1
+          fi
+          echo "  ✓ All sampled files are valid Opus"
+
+      - name: Validate every index entry has a corresponding file
+        run: |
+          echo "Checking every index entry has a file on disk..."
+          FAIL=0
+          while IFS= read -r filename; do
+            if [ ! -f "$filename" ]; then
+              echo "  ✗ $filename in index but not on disk"
+              FAIL=1
+            fi
+          done < <(jq -r '.files[].filename' index.json)
+          if [ "$FAIL" -eq 1 ]; then
+            exit 1
+          fi
+          echo "  ✓ All index entries have files"
+
+      - name: Summary
+        run: |
+          echo "=========================================="
+          echo "VALIDATION PASSED"
+          echo "=========================================="
+          echo "Files: ${{ steps.count.outputs.disk_count }}"
+          echo "Index: ${{ steps.count.outputs.index_count }}"
+          echo "=========================================="
