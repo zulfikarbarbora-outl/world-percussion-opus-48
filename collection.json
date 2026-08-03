@@ -1,0 +1,7 @@
+{
+  "collection": "audio-data",
+  "format": "opus",
+  "bitrate": 48,
+  "schema": 1,
+  "id": "world-percussion"
+}
